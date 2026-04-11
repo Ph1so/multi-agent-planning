@@ -454,7 +454,17 @@ static Path pp_astar(const Map& map, const AgentDef& agent,
         long long ck = encode(cur.x,cur.y,cur.h,cur.t);
         if (gcost.count(ck) && gcost[ck] < cur.g) continue;
 
-        if (cur.x==gx && cur.y==gy) { goal_key=ck; break; }
+        if (cur.x==gx && cur.y==gy) {
+            // Only park here if no previously-planned agent will visit this cell
+            // at any future timestep (parking is permanent — an agent stays here
+            // forever, so a future transit by another agent would be a conflict).
+            auto it = reserved.upper_bound({gx, gy, cur.t});
+            bool future_clear = (it == reserved.end()
+                                 || std::get<0>(*it) != gx
+                                 || std::get<1>(*it) != gy);
+            if (future_clear) { goal_key=ck; break; }
+            // Else: another agent transits this cell later; wait and retry.
+        }
         if (cur.t >= MAX_TIMESTEP) continue;
 
         int nt = cur.t+1;
@@ -498,44 +508,87 @@ static std::vector<Path> prioritized_planning(const Map& map) {
     int n = (int)map.agents.size();
     std::cout << "Prioritized Planning: " << n << " agents\n";
 
-    // Priority: plan the hardest agents (longest unconstrained BFS path) first.
-    // This prevents easy-to-plan agents from blocking the harder ones.
-    std::vector<int> bfs_dist(n);
-    for (int i = 0; i < n; ++i) {
-        auto hd = bfs_heuristic(map, map.agents[i].gx, map.agents[i].gy);
-        int d = hd[map.agents[i].sx][map.agents[i].sy];
-        bfs_dist[i] = (d == INT_MAX) ? 0 : d;
-    }
+    // Priority: plan agents front-of-queue first (lowest start y = closest to
+    // the interior entry).  This lets the front of the perimeter queue clear
+    // into the lot before agents further back try to enter, avoiding corridor
+    // gridlock that occurs when back-of-queue agents plan first and fill every
+    // time slot before the front agents have a chance to move.
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return bfs_dist[a] > bfs_dist[b];   // harder (longer path) → higher priority
+        return map.agents[a].sy < map.agents[b].sy;   // lower y = closer to interior
     });
 
-    ReservedSet reserved;  // (x, y, t) cells already taken
-    std::vector<Path> paths(n);
+    // Helper: run one PP pass given a set of permanently blocked cells.
+    // Returns paths (empty path = agent could not be planned).
+    // Agents whose start is in permanent_blocks are skipped entirely.
+    auto run_pass = [&](const ReservedSet& permanent_blocks,
+                        const std::set<int>& skip_agents) -> std::vector<Path> {
+        ReservedSet reserved = permanent_blocks;
+        std::vector<Path> result(n);
 
-    for (int idx = 0; idx < n; ++idx) {
-        int i = order[idx];
-        auto hdist = bfs_heuristic(map, map.agents[i].gx, map.agents[i].gy);
-        Path p = pp_astar(map, map.agents[i], reserved, hdist);
+        for (int idx = 0; idx < n; ++idx) {
+            int i = order[idx];
+            if (skip_agents.count(i)) continue;
 
-        if (p.empty()) {
-            std::cerr << "  Agent " << i << " has no path — staying at start.\n";
-            p.push_back({0, map.agents[i].sx, map.agents[i].sy, map.agents[i].sh});
+            auto hdist = bfs_heuristic(map, map.agents[i].gx, map.agents[i].gy);
+            Path p = pp_astar(map, map.agents[i], reserved, hdist);
+
+            if (p.empty()) {
+                // Permanently block this agent's start so subsequent agents
+                // in this pass cannot route through it.
+                int sx = map.agents[i].sx, sy = map.agents[i].sy;
+                for (int t = 0; t <= MAX_TIMESTEP; ++t)
+                    reserved.insert({sx, sy, t});
+                std::cerr << "  Agent " << i << " has no path — skipping.\n";
+                // result[i] stays empty
+            } else {
+                result[i] = p;
+                for (auto& s : p) reserved.insert({s.x, s.y, s.t});
+                auto& last = p.back();
+                for (int t = last.t+1; t <= MAX_TIMESTEP; ++t)
+                    reserved.insert({last.x, last.y, t});
+            }
+            if (idx % 10 == 0) std::cout << "  Planned " << idx+1 << "/" << n << "\n";
         }
-        paths[i] = p;
-        if (idx % 10 == 0) std::cout << "  Planned " << idx+1 << "/" << n << "\n";
+        return result;
+    };
 
-        // Reserve all timesteps in this path
-        for (auto& s : p) reserved.insert({s.x, s.y, s.t});
-        // Reserve goal cell for all future times (parked agent stays there)
-        if (!p.empty()) {
-            auto& last = p.back();
-            for (int t = last.t+1; t <= MAX_TIMESTEP; ++t)
-                reserved.insert({last.x, last.y, t});
-        }
+    // ── Pass 1: unconstrained ─────────────────────────────────────────────────
+    std::vector<Path> paths = run_pass({}, {});
+
+    // Identify stuck agents (empty path = could not be planned)
+    std::set<int> stuck;
+    for (int i = 0; i < n; ++i)
+        if (paths[i].empty()) stuck.insert(i);
+
+    if (stuck.empty()) {
+        std::cout << "Prioritized Planning: done.\n";
+        return paths;
     }
+
+    // ── Pass 2: re-plan with stuck agents' starts permanently blocked ─────────
+    // This ensures no successfully-planned agent routes through a cell where a
+    // stuck agent will remain forever, eliminating vertex conflicts.
+    std::cout << "  Pass 1 stuck: " << stuck.size()
+              << " agent(s). Re-planning with their starts blocked.\n";
+
+    ReservedSet stuck_blocks;
+    for (int i : stuck) {
+        int sx = map.agents[i].sx, sy = map.agents[i].sy;
+        for (int t = 0; t <= MAX_TIMESTEP; ++t)
+            stuck_blocks.insert({sx, sy, t});
+    }
+
+    paths = run_pass(stuck_blocks, stuck);
+
+    // Count remaining stuck agents
+    int still_stuck = 0;
+    for (int i = 0; i < n; ++i)
+        if (paths[i].empty() && !stuck.count(i)) ++still_stuck;
+    if (still_stuck)
+        std::cerr << "  " << still_stuck << " additional agent(s) stuck after pass 2.\n";
+
     std::cout << "Prioritized Planning: done.\n";
     return paths;
 }
@@ -552,9 +605,14 @@ static void write_trajectories(const std::vector<Path>& paths, const std::string
     std::ofstream f(out_path);
     if (!f) { std::cerr << "Cannot write: " << out_path << "\n"; return; }
     f << "# agent_id,timestep,x,y,heading  (0=E 1=N 2=W 3=S)\n";
-    for (int i = 0; i < (int)paths.size(); ++i)
+    int written = 0;
+    for (int i = 0; i < (int)paths.size(); ++i) {
+        if (paths[i].empty()) continue;   // skip unplanned agents
         for (auto& s : paths[i])
             f << i << "," << s.t << "," << s.x << "," << s.y << "," << s.h << "\n";
+        ++written;
+    }
+    std::cout << "Agents written: " << written << "/" << paths.size() << "\n";
     std::cout << "Trajectories written: " << out_path << "\n";
 }
 

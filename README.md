@@ -9,14 +9,17 @@ CMU 16-350 Final Project — Multi-agent path finding (MAPF) for autonomous vehi
 ```
 final_project/
 ├── map/
-│   ├── generate_map.py     # Generates the parking lot map file
-│   └── parking_lot.txt     # Generated map (created by generate_map.py)
+│   ├── generate_map.py      # Generates the main parking lot map
+│   ├── generate_gauntlet.py # Generates the coordination-heavy Gauntlet map
+│   ├── parking_lot.txt      # Main map (28×64, up to 144 agents)
+│   └── gauntlet.txt         # Gauntlet map (16×24, up to 24 agents)
 ├── output/
-│   ├── trajectories.txt    # Planner output (created by planner)
-│   ├── map.png             # Static map image (created by visualizer)
-│   └── result.gif          # Animated trajectories (created by visualizer)
-├── planner.cpp             # CBS + Prioritized Planning in C++
-├── visualizer.py           # Algorithm-agnostic Python visualizer
+│   ├── trajectories.txt     # Planner output (created by planner)
+│   ├── map.png              # Static map image (created by visualizer)
+│   └── result.gif           # Animated trajectories (created by visualizer)
+├── planner.cpp              # CBS + Prioritized Planning in C++
+├── checker.py               # Trajectory validity checker
+├── visualizer.py            # Algorithm-agnostic Python visualizer
 └── README.md
 ```
 
@@ -25,19 +28,14 @@ final_project/
 ## Quick start
 
 ```bash
-# 1. Generate the map (4-agent example for CBS testing)
-python3 map/generate_map.py --example
-
-# 2. Build the planner
+# 1. Build the planner (one-time)
 g++ -O2 -std=c++17 -o planner planner.cpp
 
-# 3. Run CBS (optimal, 4 agents)
+# 2. Generate a random 4-agent map and run CBS
+python3 map/generate_map.py --random 4 --seed 42
 ./planner
 
-# 4. Visualize the map (static PNG)
-python3 visualizer.py map/parking_lot.txt --save output/map.png
-
-# 5. Animate the trajectories
+# 3. Animate the result
 python3 visualizer.py map/parking_lot.txt \
     --traj output/trajectories.txt --animate --save output/result.gif
 ```
@@ -49,14 +47,27 @@ python3 visualizer.py map/parking_lot.txt \
 ### 1. Generate the map
 
 ```bash
-# 4-agent example (for CBS / quick testing)
+# 4-agent fixed example (for CBS / quick testing)
 python3 map/generate_map.py --example
 
-# All 144 agents (one per parking spot)
+# N agents with randomized starts and goals
+python3 map/generate_map.py --random 8
+python3 map/generate_map.py --random 8 --seed 42   # reproducible
+
+# All 144 agents, deterministic ordering
 python3 map/generate_map.py
 ```
 
-Both write `map/parking_lot.txt`.
+All variants write `map/parking_lot.txt`.
+
+**`generate_map.py` flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--example` | Fixed 4-agent test case (two left-entry, two right-entry) |
+| `--random N` | N agents with randomly shuffled starts and goals (N ≤ 144) |
+| `--seed K` | Integer seed for `--random` — same seed always produces the same map |
+| *(none)* | All 144 agents, deterministic row-by-row ordering |
 
 ### 2. Build the planner
 
@@ -132,7 +143,7 @@ python3 visualizer.py map/parking_lot.txt \
 
 ## Recommended workflows
 
-### Test CBS on 4 agents
+### Test CBS on 4 agents (main map)
 
 ```bash
 python3 map/generate_map.py --example
@@ -141,13 +152,31 @@ python3 visualizer.py map/parking_lot.txt \
     --traj output/trajectories.txt --animate --save output/result.gif
 ```
 
-### Run Prioritized Planning on 16 agents
+### Run Prioritized Planning on 50 agents (main map)
 
 ```bash
-python3 map/generate_map.py
-./planner --pp --max-agents 16
+python3 map/generate_map.py --random 50 --seed 42
+./planner --pp
 python3 visualizer.py map/parking_lot.txt \
     --traj output/trajectories.txt --animate --save output/result.gif
+```
+
+### Gauntlet — CBS on 8 agents (bidirectional, coordination-heavy)
+
+```bash
+python3 map/generate_gauntlet.py --example
+./planner map/gauntlet.txt output/gauntlet.txt
+python3 checker.py map/gauntlet.txt output/gauntlet.txt
+python3 visualizer.py map/gauntlet.txt \
+    --traj output/gauntlet.txt --animate --save output/gauntlet.gif
+```
+
+### Gauntlet — PP on all 24 crossing agents
+
+```bash
+python3 map/generate_gauntlet.py
+./planner --pp map/gauntlet.txt output/gauntlet.txt
+python3 checker.py map/gauntlet.txt output/gauntlet.txt
 ```
 
 ### View just the map
@@ -208,6 +237,40 @@ y= 0  └───────────────────────�
 
 8 parking rows × 18 spots each = **144 spots total**.
 Agents enter from the top corners and navigate to their assigned spot.
+
+---
+
+## Gauntlet map (16 × 24)
+
+`map/gauntlet.txt` — a smaller, coordination-heavy map designed to stress-test planners.
+
+```
+y=23  ┌──────────────┐
+      │  outer wall  │
+y=21  │  top queue   │  ← agents start here heading South
+y=18  │              │
+y=17  │ top access   │  ← x=2-13, 2-wide road
+y=15  │  row D ══════│
+y=14  │  ─ divider ─ │
+y=13  │  row C ══════│
+y=12  │ central lane │  ← 2-wide BOTTLENECK (all agents cross here)
+y=11  │              │
+y=10  │  row B ══════│
+y= 9  │  ─ divider ─ │
+y= 8  │  row A ══════│
+y= 7  │ bottom access│  ← x=2-13, 2-wide road
+y= 5  │ bottom queue │  ← agents start here heading North
+y= 2  │              │
+y= 0  └──────────────┘
+       x=0 .. x=15
+```
+
+**What makes it hard:** top agents are assigned spots in the *bottom* half (rows A & B) and bottom agents are assigned spots in the *top* half (rows C & D). Every single agent must cross the 2-wide central lane in *opposite directions*, producing unavoidable head-on conflicts.
+
+| Mode | Agents | CBS nodes | Result |
+|------|--------|-----------|--------|
+| `--example` | 8 | ~160 | optimal |
+| all crossing | 24 | >10,000 (node limit) | use `--pp` |
 
 ---
 
