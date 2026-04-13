@@ -9,10 +9,14 @@ CMU 16-350 Final Project — Multi-agent path finding (MAPF) for autonomous vehi
 ```
 final_project/
 ├── map/
-│   ├── generate_map.py      # Generates the main parking lot map
-│   ├── generate_gauntlet.py # Generates the coordination-heavy Gauntlet map
-│   ├── parking_lot.txt      # Main map (28×64, up to 144 agents)
-│   └── gauntlet.txt         # Gauntlet map (16×24, up to 24 agents)
+│   ├── generate_map.py               # Generates the main parking lot map
+│   ├── generate_gauntlet.py          # Generates the coordination-heavy Gauntlet map
+│   ├── generate_two_lots.py          # Generates the Two Lots map (3 connecting roads)
+│   ├── generate_two_lots_gauntlet.py # Generates the Two Lots Gauntlet (16-agent bottleneck)
+│   ├── parking_lot.txt               # Main map (28×64, up to 144 agents)
+│   ├── gauntlet.txt                  # Gauntlet map (16×24, up to 24 agents)
+│   ├── two_lots.txt                  # Two Lots map (48×38, 16 agents default)
+│   └── two_lots_gauntlet.txt         # Two Lots Gauntlet (30×26, 16 agents)
 ├── output/
 │   ├── trajectories.txt     # Planner output (created by planner)
 │   ├── map.png              # Static map image (created by visualizer)
@@ -179,6 +183,33 @@ python3 map/generate_gauntlet.py
 python3 checker.py map/gauntlet.txt output/gauntlet.txt
 ```
 
+### Two Lots — PP on 16 crossing agents
+
+8 agents start in the left lot with goals in the right lot; 8 do the reverse.
+All must cross one of three roads connecting the lots.
+
+```bash
+python3 map/generate_two_lots.py
+./planner --pp map/two_lots.txt output/two_lots.txt
+python3 checker.py map/two_lots.txt output/two_lots.txt
+python3 visualizer.py map/two_lots.txt \
+    --traj output/two_lots.txt --animate --save output/two_lots.gif
+```
+
+### Two Lots Gauntlet — PP on 16 agents (brutal 2-cell bottleneck)
+
+Same crossing scenario on a compact 30×26 map where the only short routes are
+2 cells wide. Agents heading in opposite directions can barely squeeze past each
+other, guaranteeing heavy coordination load.
+
+```bash
+python3 map/generate_two_lots_gauntlet.py
+./planner --pp map/two_lots_gauntlet.txt output/two_lots_gauntlet.txt
+python3 checker.py map/two_lots_gauntlet.txt output/two_lots_gauntlet.txt
+python3 visualizer.py map/two_lots_gauntlet.txt \
+    --traj output/two_lots_gauntlet.txt --animate --save output/two_lots_gauntlet.gif
+```
+
 ### View just the map
 
 ```bash
@@ -271,6 +302,100 @@ y= 0  └──────────────┘
 |------|--------|-----------|--------|
 | `--example` | 8 | ~160 | optimal |
 | all crossing | 24 | >10,000 (node limit) | use `--pp` |
+
+---
+
+## Two Lots map (48 × 38)
+
+`map/two_lots.txt` — two mirror-image parking lots side-by-side, separated by a
+wall with three openings.  Agents assigned to the opposite lot must negotiate
+one of the three roads.
+
+```
+y=37  ████████████████████████████████████████████████ (outer wall)
+y=34  ██ ══════════════ Road 3 bypass (x=2–45) ═════ ██  ← long detour
+y=33  same
+y=23  ██ top access   │WALL│ top access ██
+y=21  ██ row H        │WALL│ row H      ██
+      ...
+y=18  ██ ══════════════════ Road 2 (y=17–18) ═══════ ██  ← 4-wide bottleneck
+y=17  same
+      ...
+y= 8  ██ ══════════════════ Road 1 (y=7–8)  ═══════ ██  ← 4-wide bottleneck
+y= 7  same
+      ...
+y= 4  ██ row A        │WALL│ row A      ██
+y= 2  ██ bottom access│WALL│ bottom acc ██
+y= 0  ████████████████████████████████████████████████
+
+       x=0  2   4        19  20   22 25  26  28       43  44  46  47
+            per div 14sp div perim ROAD perim div 14sp div  perim wall
+                     LEFT LOT      ←roads→    RIGHT LOT
+```
+
+8 parking rows × 14 spots = **112 spots per lot, 224 total**.
+
+**Three roads:**
+
+| Road | y-rows | x-columns | Length | Notes |
+|------|--------|-----------|--------|-------|
+| Road 1 | 7–8 | 22–25 | 4 cells wide | Short — upper bottleneck |
+| Road 2 | 17–18 | 22–25 | 4 cells wide | Short — lower bottleneck |
+| Road 3 | 33–34 | 2–45 | full width | Long bypass via top perimeter |
+
+**`generate_two_lots.py` flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--n N` | Agents per side for crossing scenario (default 8, total 16) |
+| `--random N` | N agents with random starts and goals |
+| `--seed K` | Random seed |
+
+---
+
+## Two Lots Gauntlet map (30 × 26)
+
+`map/two_lots_gauntlet.txt` — compact version of Two Lots for 16 agents.
+The two bottleneck roads are only **2 cells wide**, meaning at most 2 agents
+(one per lane) can cross simultaneously in opposite directions.
+
+```
+y=25  ██████████████████████████████ (outer wall)
+y=22  ██ ════ Road 3 bypass ═════ ██  (x=2–27, long detour)
+y=21  same
+y=19  ██ [queue]  │WALL│ [queue] ██   ← agents start here
+y=17  ██ top acc  │WALL│ top acc ██
+y=16  ██ row E    │WALL│ row E   ██
+y=14  ██ ═══ Road 2 (y=13–14) ═══ ██  ← 2-cell bottleneck
+y=13  same
+y=12  ██ row D    │WALL│ row D   ██
+y=10  ██ row C    │WALL│ row C   ██
+y= 8  ██ ═══ Road 1 (y=7–8)  ═══ ██  ← 2-cell bottleneck
+y= 7  same
+y= 6  ██ row B    │WALL│ row B   ██
+y= 4  ██ row A    │WALL│ row A   ██
+y= 2  ██ btm acc  │WALL│ btm acc ██
+y= 0  ██████████████████████████████
+
+       x=0  2   4  5    10 11 12 13 14 15 16 17 18  19    24 25 26 27 28 29
+            per div 6sp div perim ←2→  perim div 6sp div  perim wall
+                    LEFT LOT    roads   RIGHT LOT
+```
+
+5 parking rows × 6 spots = **30 spots per lot, 60 total**.
+16 agents (8 per side) all assigned to the opposite lot.
+
+**What makes it hard:** roads are only 2 cells wide (x=14–15), forcing agents
+to queue.  With 8 agents competing for each short road, waits are unavoidable.
+Road 3 avoids the pinch but costs ~30 extra steps.
+
+**`generate_two_lots_gauntlet.py` flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--random N` | N agents with random starts/goals (max 16) |
+| `--seed K` | Random seed |
+| *(none)* | Fixed 16-agent gauntlet layout |
 
 ---
 
