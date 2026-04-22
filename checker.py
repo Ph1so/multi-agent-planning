@@ -7,7 +7,10 @@ Verifies:
   2. Edge (swap) conflicts — no two agents swapping cells between consecutive steps
   3. Wall collisions    — no agent enters a cell with value >= collision_threshold
   4. Valid moves        — each step is reachable by a legal action
-                          (forward, backward, turn-left, turn-right, wait)
+                          (forward, backward, 2-step turn-left,
+                           2-step turn-right, wait)
+  5. Goal pose          — each recorded trajectory ends at its assigned goal,
+                          facing the separator wall when required
 
 Usage:
   python checker.py map/parking_lot.txt output/trajectories.txt
@@ -21,6 +24,14 @@ from collections import defaultdict
 # heading → (dx, dy)
 DX = {0: 1, 1: 0, 2: -1, 3: 0}
 DY = {0: 0, 1: 1, 2: 0, 3: -1}
+
+
+def _parse_heading(s):
+    if s is None:
+        return None
+    mapping = {'E': 0, 'N': 1, 'W': 2, 'S': 3,
+               '0': 0, '1': 1, '2': 2, '3': 3}
+    return mapping.get(str(s).strip().upper())
 
 
 # ── Parsers (minimal, no numpy dependency) ───────────────────────────────────
@@ -40,8 +51,14 @@ def parse_map(path):
         elif hdr == 'A':
             n = int(lines[i]); i += 1
             result['num_agents'] = n
+            goals = []
             for _ in range(n):
-                i += 2   # skip start and goal lines
+                i += 1   # skip start line
+                goal_parts = lines[i].split(','); i += 1
+                gx, gy = int(goal_parts[0]), int(goal_parts[1])
+                gh = _parse_heading(goal_parts[2]) if len(goal_parts) > 2 else None
+                goals.append((gx, gy, gh))
+            result['agent_goals'] = goals
         elif hdr == 'M':
             grid = {}
             for y in range(result['H']):
@@ -166,7 +183,9 @@ def check_wall_collisions(trajs, grid, thresh):
 def check_move_validity(trajs):
     """
     Check that consecutive steps in each agent's trajectory correspond to
-    a legal action: forward, backward, turn-left, turn-right, or wait.
+    a legal action: forward, backward, 2-step turn-left, 2-step turn-right,
+    or wait. A turn must be completed from the forward cell reached in the
+    immediately preceding timestep.
     Returns list of (agent, t, reason) for illegal transitions.
     """
     violations = []
@@ -183,28 +202,108 @@ def check_move_validity(trajs):
 
             dx, dy = x1 - x0, y1 - y0
             dh = (h1 - h0) % 4
+            left_h = (h0 + 1) % 4
+            right_h = (h0 + 3) % 4
 
             # Legal transitions:
             #   wait        : dx=dy=0, dh=0
-            #   turn-left   : dx=dy=0, dh=1
-            #   turn-right  : dx=dy=0, dh=3
             #   forward     : (dx,dy)=(DX[h0],DY[h0]), dh=0
             #   backward    : (dx,dy)=(-DX[h0],-DY[h0]), dh=0
+            #   turn-left   : prior step moved forward with heading h0,
+            #                 then (dx,dy)=(DX[left_h],DY[left_h]), dh=1
+            #   turn-right  : prior step moved forward with heading h0,
+            #                 then (dx,dy)=(DX[right_h],DY[right_h]), dh=3
             if dx == 0 and dy == 0:
-                if dh not in (0, 1, 3):
+                if dh != 0:
                     violations.append((aid, t0,
-                        f'illegal turn: heading {h0}->{h1}'))
-            elif dh != 0:
-                violations.append((aid, t0,
-                    f'moved and turned in one step: '
-                    f'({x0},{y0},{h0})->({x1},{y1},{h1})'))
-            else:
+                        'in-place turns are no longer allowed'))
+            elif dh == 0:
                 fwd = (DX[h0], DY[h0])
                 bwd = (-DX[h0], -DY[h0])
                 if (dx, dy) not in (fwd, bwd):
                     violations.append((aid, t0,
                         f'illegal move direction: '
                         f'({x0},{y0},h={h0})->({x1},{y1})'))
+            elif dh == 1:
+                ok = (dx, dy) == (DX[left_h], DY[left_h])
+                if ok and k > 0:
+                    tp, xp, yp, hp = steps[k - 1]
+                    ok = (tp == t0 - 1 and hp == h0 and
+                          (x0 - xp, y0 - yp) == (DX[h0], DY[h0]))
+                else:
+                    ok = False
+                if not ok:
+                    violations.append((aid, t0,
+                        f'illegal left turn: '
+                        f'({x0},{y0},h={h0})->({x1},{y1},h={h1})'))
+            elif dh == 3:
+                ok = (dx, dy) == (DX[right_h], DY[right_h])
+                if ok and k > 0:
+                    tp, xp, yp, hp = steps[k - 1]
+                    ok = (tp == t0 - 1 and hp == h0 and
+                          (x0 - xp, y0 - yp) == (DX[h0], DY[h0]))
+                else:
+                    ok = False
+                if not ok:
+                    violations.append((aid, t0,
+                        f'illegal right turn: '
+                        f'({x0},{y0},h={h0})->({x1},{y1},h={h1})'))
+            else:
+                violations.append((aid, t0,
+                    f'illegal heading change: heading {h0}->{h1}'))
+    return violations
+
+
+def _infer_wall_facing_heading(map_data, x, y):
+    grid = map_data['grid']
+    thresh = map_data.get('thresh', 100)
+    if grid.get((x, y), thresh) != 1:
+        return None
+
+    def is_wall(nx, ny):
+        if nx < 0 or nx >= map_data['W'] or ny < 0 or ny >= map_data['H']:
+            return True
+        return grid.get((nx, ny), thresh) >= thresh
+
+    north_wall = is_wall(x, y + 1)
+    south_wall = is_wall(x, y - 1)
+    if north_wall != south_wall:
+        return 1 if north_wall else 3
+
+    found = None
+    for h in range(4):
+        if not is_wall(x + DX[h], y + DY[h]):
+            continue
+        if found is not None:
+            return None
+        found = h
+    return found
+
+
+def check_goal_conditions(trajs, map_data):
+    """
+    Check that each recorded trajectory ends at its assigned goal cell and,
+    when a goal heading is known or inferable, ends with that heading.
+    Returns list of (agent, reason).
+    """
+    goals = map_data.get('agent_goals', [])
+    violations = []
+
+    for aid, steps in trajs.items():
+        if not steps or aid >= len(goals):
+            continue
+
+        gx, gy, gh = goals[aid]
+        final_t, fx, fy, fh = steps[-1]
+        if (fx, fy) != (gx, gy):
+            violations.append((aid,
+                f'final state at t={final_t} ends at ({fx},{fy}) instead of goal ({gx},{gy})'))
+            continue
+
+        required_h = gh if gh is not None else _infer_wall_facing_heading(map_data, gx, gy)
+        if required_h is not None and fh >= 0 and fh != required_h:
+            violations.append((aid,
+                f'final heading {fh} does not face separator wall at goal ({gx},{gy}); expected {required_h}'))
     return violations
 
 
@@ -284,6 +383,19 @@ def main():
                 print(f'       agent {aid}  t={t}  {reason}')
     else:
         print('[PASS] All moves are legal')
+
+    # 5. Goal completion / parked heading
+    gc = check_goal_conditions(trajs, map_data)
+    if gc:
+        all_ok = False
+        print(f'[FAIL] Goal pose violations: {len(gc)}')
+        if args.verbose:
+            for aid, reason in gc[:20]:
+                print(f'       agent {aid}  {reason}')
+            if len(gc) > 20:
+                print(f'       … and {len(gc)-20} more')
+    else:
+        print('[PASS] All recorded trajectories end at valid goal poses')
 
     print()
     if all_ok:

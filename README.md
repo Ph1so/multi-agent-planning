@@ -15,12 +15,16 @@ final_project/
 │   ├── generate_two_lots_gauntlet.py # Generates the Two Lots Gauntlet (16-agent bottleneck)
 │   ├── parking_lot.txt               # Main map (28×64, up to 144 agents)
 │   ├── gauntlet.txt                  # Gauntlet map (16×24, up to 24 agents)
-│   ├── two_lots.txt                  # Two Lots map (48×38, 16 agents default)
+│   ├── two_lots.txt                  # Two Lots map (48×52, 16 agents default)
 │   └── two_lots_gauntlet.txt         # Two Lots Gauntlet (30×26, 16 agents)
 ├── output/
 │   ├── trajectories.txt     # Planner output (created by planner)
 │   ├── map.png              # Static map image (created by visualizer)
 │   └── result.gif           # Animated trajectories (created by visualizer)
+├── docs/
+│   ├── benchmark_story.png  # Composite benchmark/process visual for Gauntlet
+│   └── benchmark_metrics.json # Raw metrics used by the benchmark visual
+├── benchmark_story.py       # Reproducible benchmark + figure generator
 ├── planner.cpp              # CBS + Prioritized Planning in C++
 ├── checker.py               # Trajectory validity checker
 ├── visualizer.py            # Algorithm-agnostic Python visualizer
@@ -105,6 +109,10 @@ g++ -O2 -std=c++17 -o planner planner.cpp
 | *(positional 1)* | Map file path (default: `map/parking_lot.txt`) |
 | *(positional 2)* | Output trajectory path (default: `output/trajectories.txt`) |
 
+Each run also ends with a machine-readable `STAT ...` line containing runtime,
+makespan, low-level A* calls, and CBS node/conflict counts.  The benchmark
+visual below is generated directly from those stats.
+
 ### 4. Visualize
 
 ```bash
@@ -142,6 +150,30 @@ python3 visualizer.py map/parking_lot.txt \
 | `--save FILE` | Save to file (`.png`, `.gif`, or `.mp4`) |
 | `--fps N` | Frames per second for animation (default 5) |
 | `--no-agents` | Hide start/goal markers on static view |
+
+### 5. Generate the benchmark/process visual
+
+```bash
+# Benchmark balanced Gauntlet crossing cases and render the composite figure
+# (builds a temporary planner from planner.cpp when needed)
+python3 benchmark_story.py
+```
+
+Outputs:
+
+- `docs/benchmark_story.png` — composite visual with the Gauntlet bottleneck,
+  runtime/search scaling, and a side-by-side CBS vs PP planning-process story.
+- `docs/benchmark_metrics.json` — raw benchmark numbers used to render the
+  figure.
+
+Why this visual is useful: it benchmarks balanced Gauntlet instances from
+4→24 agents, where all agents must traverse the same 2-cell central lane in
+opposite directions.  That shared bottleneck creates many simultaneous root
+conflicts for CBS, which then explodes into repeated constraint-tree branches
+and low-level replans.  Prioritized Planning handles the same pressure by
+turning it into queueing and reservations instead of search branching.
+
+![Gauntlet benchmark story](docs/benchmark_story.png)
 
 ---
 
@@ -225,18 +257,18 @@ python3 visualizer.py map/parking_lot.txt --save output/map.png
 
 ```
 N
-80,64          ← grid width, height
+28,64          ← grid width, height
 C
 100            ← collision threshold (cells >= this value are walls)
 A
 4              ← number of agents
 2,63,N         ← agent 0 start: x, y, heading  (N/S/E/W)
-6,6            ← agent 0 goal:  x, y
+6,6,1          ← agent 0 goal:  x, y, heading (optional)
 3,63,N         ← agent 1 start
-10,6           ← agent 1 goal
+10,6,3         ← agent 1 goal
 ...
 M
-100,100,...    ← row y=0 (x = 0..79)
+100,100,...    ← row y=0 (x = 0..27)
 ...            ← row y=1 ... row y=63
 ```
 
@@ -244,26 +276,36 @@ M
 
 **Heading values:** `0`/`E` = East, `1`/`N` = North, `2`/`W` = West, `3`/`S` = South.
 
-### Map layout (80 × 64 grid)
+Goal headings are optional. If a goal heading is omitted and the goal is a
+parking spot, the planner and checker infer the required parked heading from
+the adjacent separator wall, so cars finish facing into the wall by default.
+
+### Map layout (28 × 64 grid)
 
 ```
-y=63  ┌──────────────────────────────────────────────────────┐
-      │  outer wall                                          │
-y=54  │──── lane 4 (y=54-56) ──────────────────────────────│
-y=50  │  parking row H                                       │
-y=44  │  parking row G                                       │
-y=41  │──── lane 3 (y=41-43) ──────────────────────────────│
-y=37  │  parking row F                                       │
-y=31  │  parking row E                                       │
-y=28  │──── lane 2 (y=28-30) ──────────────────────────────│
-y=24  │  parking row D                                       │
-y=18  │  parking row C                                       │
-y=15  │──── lane 1 (y=15-17) ──────────────────────────────│
-y=11  │  parking row B                                       │
-y= 5  │  parking row A                                       │
-y= 2  │──── top access road (y=2-4) ───────────────────────│
-y= 0  └──────────────────────────────────────────────────────┘
-       x=0  x=2-3: left perimeter    x=76-77: right perimeter
+y=63  ┌─────────────────────────┐
+      │  outer wall             │
+y=28  │  perimeter queue area   │  ← x=2-3 and x=24-25 are ROAD
+y=24  │  interior top wall      │
+y=22  │──── lane 4 (y=22-23) ──│
+y=21  │  parking row H          │
+y=20  │  divider wall           │
+y=19  │  parking row G          │
+y=17  │──── lane 3 (y=17-18) ──│
+y=16  │  parking row F          │
+y=15  │  divider wall           │
+y=14  │  parking row E          │
+y=12  │──── lane 2 (y=12-13) ──│
+y=11  │  parking row D          │
+y=10  │  divider wall           │
+y= 9  │  parking row C          │
+y= 7  │──── lane 1 (y=7-8) ────│
+y= 6  │  parking row B          │
+y= 5  │  divider wall           │
+y= 4  │  parking row A          │
+y= 2  │──── access road (y=2-3)│
+y= 0  └─────────────────────────┘
+       x=0-1 wall  x=2-3 left perim  x=5-22 spots  x=24-25 right perim
 ```
 
 8 parking rows × 18 spots each = **144 spots total**.
@@ -305,7 +347,7 @@ y= 0  └──────────────┘
 
 ---
 
-## Two Lots map (48 × 38)
+## Two Lots map (48 × 52)
 
 `map/two_lots.txt` — two mirror-image parking lots side-by-side, separated by a
 wall with three openings.  Agents assigned to the opposite lot must negotiate
@@ -419,15 +461,21 @@ The heading column is optional; the visualizer accepts files with or without it.
 
 ## Motion model
 
-Each agent has state `(x, y, heading)`. One action per timestep, all cost 1:
+Each agent has state `(x, y, heading)`. Forward, backward, and wait consume
+one timestep. A left/right turn is a single control choice, but it executes as
+a 2-timestep maneuver with an intermediate forward state:
 
 | Action | Effect |
 |--------|--------|
 | `FORWARD` | Move +1 cell in heading direction |
 | `BACKWARD` | Move −1 cell in heading direction |
-| `TURN_LEFT` | heading = (heading + 1) % 4 |
-| `TURN_RIGHT` | heading = (heading + 3) % 4 |
+| `TURN_LEFT` | `t→t+1`: move forward one cell. `t+1→t+2`: move into the forward-left cell and update heading left |
+| `TURN_RIGHT` | `t→t+1`: move forward one cell. `t+1→t+2`: move into the forward-right cell and update heading right |
 | `WAIT` | No change |
+
+Parking completion is pose-based: the agent must reach the goal cell with the
+required final heading. For parking spots, that heading defaults to the
+separator-wall-facing direction if the map file does not specify one.
 
 ---
 

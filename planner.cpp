@@ -2,12 +2,16 @@
  * planner.cpp — Conflict-Based Search (CBS) for multi-agent parking lot
  *
  * State:  (x, y, heading)   heading: 0=E 1=N 2=W 3=S
- * Actions per timestep (all cost 1):
- *   FORWARD   — move +1 cell in heading direction
- *   BACKWARD  — move -1 cell in heading direction
- *   TURN_LEFT  — heading = (heading + 1) % 4  (no position change)
- *   TURN_RIGHT — heading = (heading + 3) % 4
- *   WAIT      — stay
+ * Control actions:
+ *   FORWARD    — move +1 cell in heading direction
+ *   BACKWARD   — move -1 cell in heading direction
+ *   TURN_LEFT  — 2-timestep maneuver:
+ *                  (1) move forward one cell
+ *                  (2) move into the forward-left cell and face left
+ *   TURN_RIGHT — 2-timestep maneuver:
+ *                  (1) move forward one cell
+ *                  (2) move into the forward-right cell and face right
+ *   WAIT       — stay
  *
  * Reads:  map/parking_lot.txt  (N/C/A/M format)
  * Writes: output/trajectories.txt  (agent_id,timestep,x,y,heading)
@@ -29,6 +33,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <queue>
 #include <set>
@@ -51,7 +56,7 @@ static const int DY[4] = { 0,  1,  0, -1};
 
 struct AgentDef {
     int sx, sy, sh;   // start (heading 0-3)
-    int gx, gy;       // goal  (any heading at goal)
+    int gx, gy, gh;   // goal  (heading 0-3, or -1 if unconstrained)
 };
 
 // A single position in a trajectory
@@ -59,6 +64,12 @@ struct Step {
     int t, x, y, h;
 };
 using Path = std::vector<Step>;   // time-ordered path for one agent
+
+enum TurnPhase {
+    TURN_NONE = 0,
+    TURN_LEFT_PENDING = 1,
+    TURN_RIGHT_PENDING = 2,
+};
 
 // ── Constraint types ─────────────────────────────────────────────────────────
 
@@ -91,6 +102,66 @@ static int parse_heading(const std::string& s) {
     if (s == "W" || s == "2") return 2;
     if (s == "S" || s == "3") return 3;
     return 1;  // default North
+}
+
+static inline int left_heading(int h)  { return (h + 1) % 4; }
+static inline int right_heading(int h) { return (h + 3) % 4; }
+
+static bool is_pending_turn(int phase) {
+    return phase == TURN_LEFT_PENDING || phase == TURN_RIGHT_PENDING;
+}
+
+static int turn_target_heading(int h, int phase) {
+    return (phase == TURN_LEFT_PENDING) ? left_heading(h) : right_heading(h);
+}
+
+static bool can_start_turn(const Map& map, int x, int y, int h, int phase,
+                           int& ix, int& iy) {
+    ix = x + DX[h];
+    iy = y + DY[h];
+    if (!map.passable(ix, iy)) return false;
+
+    int th = turn_target_heading(h, phase);
+    int fx = ix + DX[th];
+    int fy = iy + DY[th];
+    return map.passable(fx, fy);
+}
+
+static void apply_completion(int x, int y, int h, int phase,
+                             int& nx, int& ny, int& nh, int& nphase) {
+    nh = turn_target_heading(h, phase);
+    nx = x + DX[nh];
+    ny = y + DY[nh];
+    nphase = TURN_NONE;
+}
+
+static int infer_wall_facing_heading(const Map& map, int x, int y) {
+    if (x < 0 || x >= map.W || y < 0 || y >= map.H) return -1;
+    if (map.grid[x][y] != 1) return -1;  // only infer for parking spots
+
+    auto is_wall = [&](int nx, int ny) -> bool {
+        if (nx < 0 || nx >= map.W || ny < 0 || ny >= map.H) return true;
+        return map.grid[nx][ny] >= map.collision_thresh;
+    };
+
+    bool north_wall = is_wall(x, y + 1);
+    bool south_wall = is_wall(x, y - 1);
+    if (north_wall != south_wall) return north_wall ? 1 : 3;
+
+    const struct Dir { int h, dx, dy; } dirs[4] = {
+        {0,  1,  0},
+        {1,  0,  1},
+        {2, -1,  0},
+        {3,  0, -1},
+    };
+
+    int found = -1;
+    for (const auto& dir : dirs) {
+        if (!is_wall(x + dir.dx, y + dir.dy)) continue;
+        if (found != -1) return -1;  // ambiguous; leave unconstrained
+        found = dir.h;
+    }
+    return found;
 }
 
 // ── Map file parser ───────────────────────────────────────────────────────────
@@ -136,7 +207,9 @@ static Map load_map(const std::string& path, int max_agents = INT_MAX) {
           std::getline(ss, tok, ','); a.sh = parse_heading(tok); }
         { std::istringstream ss(gline);
           std::getline(ss, tok, ','); a.gx = std::stoi(tok);
-          std::getline(ss, tok, ','); a.gy = std::stoi(tok); }
+          std::getline(ss, tok, ','); a.gy = std::stoi(tok);
+          if (std::getline(ss, tok, ',')) a.gh = parse_heading(tok);
+          else                            a.gh = -1; }
         m.agents.push_back(a);
     }
 
@@ -149,6 +222,10 @@ static Map load_map(const std::string& path, int max_agents = INT_MAX) {
             std::getline(ss, tok, ',');
             m.grid[x][y] = std::stoi(tok);
         }
+    }
+    for (auto& agent : m.agents) {
+        if (agent.gh < 0)
+            agent.gh = infer_wall_facing_heading(m, agent.gx, agent.gy);
     }
     std::cout << "Loaded map " << m.W << "x" << m.H
               << "  agents=" << m.agents.size()
@@ -183,13 +260,17 @@ static std::vector<std::vector<int>> bfs_heuristic(const Map& map, int gx, int g
 // Search from (sx,sy,sh,0) to (gx,gy,*,t>=0) under constraints.
 
 struct AStarNode {
-    int f, g, x, y, h, t;
+    int f, g, x, y, h, phase, t;
     bool operator>(const AStarNode& o) const { return f > o.f; }
 };
 
-// Key for closed set: (x, y, h, t) packed into 64 bits
-static inline long long encode(int x, int y, int h, int t) {
-    return ((long long)t << 20) | ((long long)x << 10) | ((long long)y << 4) | h;
+// Key for closed set: (x, y, h, phase, t) packed into 64 bits
+static inline long long encode(int x, int y, int h, int phase, int t) {
+    return ((long long)t << 22)
+         | ((long long)x << 12)
+         | ((long long)y << 4)
+         | ((long long)phase << 2)
+         | h;
 }
 
 static Path low_level_astar(const Map& map, const AgentDef& agent,
@@ -201,7 +282,7 @@ static Path low_level_astar(const Map& map, const AgentDef& agent,
     for (auto& c : cons.vert) if (c.agent == agent_id) vc.insert({c.x, c.y, c.t});
     for (auto& c : cons.edge) if (c.agent == agent_id) ec.insert({c.x1,c.y1,c.x2,c.y2,c.t});
 
-    int gx = agent.gx, gy = agent.gy;
+    int gx = agent.gx, gy = agent.gy, gh = agent.gh;
 
     // h value: BFS distance, or 0 if goal unreachable (handles edge cases)
     auto hval = [&](int x, int y) -> int {
@@ -211,56 +292,93 @@ static Path low_level_astar(const Map& map, const AgentDef& agent,
 
     std::unordered_map<long long, int>      gcost;
     std::unordered_map<long long, long long> parent;
-    struct NodeInfo { int x, y, h, t; };
+    struct NodeInfo { int x, y, h, phase, t; };
     std::unordered_map<long long, NodeInfo>  ndata;
 
     std::priority_queue<AStarNode, std::vector<AStarNode>, std::greater<AStarNode>> open;
 
     int sx = agent.sx, sy = agent.sy, sh = agent.sh;
-    long long sk = encode(sx, sy, sh, 0);
+    long long sk = encode(sx, sy, sh, TURN_NONE, 0);
     int hv = hval(sx, sy);
-    open.push({hv, 0, sx, sy, sh, 0});
+    open.push({hv, 0, sx, sy, sh, TURN_NONE, 0});
     gcost[sk] = 0;
     parent[sk] = -1;
-    ndata[sk]  = {sx, sy, sh, 0};
+    ndata[sk]  = {sx, sy, sh, TURN_NONE, 0};
 
     long long goal_key = -1;
 
     while (!open.empty()) {
         AStarNode cur = open.top(); open.pop();
-        long long ck = encode(cur.x, cur.y, cur.h, cur.t);
+        long long ck = encode(cur.x, cur.y, cur.h, cur.phase, cur.t);
 
         auto it = gcost.find(ck);
         if (it == gcost.end() || it->second < cur.g) continue;
 
-        if (cur.x == gx && cur.y == gy) { goal_key = ck; break; }
+        if (cur.phase == TURN_NONE &&
+            cur.x == gx && cur.y == gy && (gh < 0 || cur.h == gh)) {
+            goal_key = ck;
+            break;
+        }
         if (cur.t >= MAX_TIMESTEP) continue;
 
         int nt = cur.t + 1;
 
-        // 5 actions: forward, backward, turn-left, turn-right, wait
+        if (is_pending_turn(cur.phase)) {
+            int nx = cur.x, ny = cur.y, nh = cur.h, nphase = cur.phase;
+            apply_completion(cur.x, cur.y, cur.h, cur.phase, nx, ny, nh, nphase);
+
+            if (!map.passable(nx, ny)) continue;
+            if (vc.count({nx, ny, nt})) continue;
+            if (ec.count({cur.x, cur.y, nx, ny, cur.t})) continue;
+
+            int ng  = cur.g + 1;
+            long long nk = encode(nx, ny, nh, nphase, nt);
+            auto git = gcost.find(nk);
+            if (git != gcost.end() && git->second <= ng) continue;
+
+            gcost[nk]  = ng;
+            parent[nk] = ck;
+            ndata[nk]  = {nx, ny, nh, nphase, nt};
+            open.push({ng + hval(nx, ny), ng, nx, ny, nh, nphase, nt});
+            continue;
+        }
+
+        // 5 controls from a normal state: forward, backward, start-left-turn,
+        // start-right-turn, wait.
         for (int act = 0; act < 5; ++act) {
-            int nx = cur.x, ny = cur.y, nh = cur.h;
+            int nx = cur.x, ny = cur.y, nh = cur.h, nphase = TURN_NONE;
             bool moves = false;
-            if      (act == 0) { nx+=DX[cur.h]; ny+=DY[cur.h]; moves=true; }
-            else if (act == 1) { nx-=DX[cur.h]; ny-=DY[cur.h]; moves=true; }
-            else if (act == 2) { nh=(cur.h+1)%4; }
-            else if (act == 3) { nh=(cur.h+3)%4; }
-            // act==4: wait (nx,ny,nh unchanged)
+
+            if (act == 0) {
+                nx += DX[cur.h];
+                ny += DY[cur.h];
+                moves = true;
+            } else if (act == 1) {
+                nx -= DX[cur.h];
+                ny -= DY[cur.h];
+                moves = true;
+            } else if (act == 2 || act == 3) {
+                int ix = cur.x, iy = cur.y;
+                nphase = (act == 2) ? TURN_LEFT_PENDING : TURN_RIGHT_PENDING;
+                if (!can_start_turn(map, cur.x, cur.y, cur.h, nphase, ix, iy)) continue;
+                nx = ix;
+                ny = iy;
+                moves = true;
+            }
 
             if (!map.passable(nx, ny)) continue;
             if (vc.count({nx, ny, nt})) continue;
             if (moves && ec.count({cur.x,cur.y,nx,ny,cur.t})) continue;
 
             int ng  = cur.g + 1;
-            long long nk = encode(nx, ny, nh, nt);
+            long long nk = encode(nx, ny, nh, nphase, nt);
             auto git = gcost.find(nk);
             if (git != gcost.end() && git->second <= ng) continue;
 
             gcost[nk]  = ng;
             parent[nk] = ck;
-            ndata[nk]  = {nx, ny, nh, nt};
-            open.push({ng + hval(nx, ny), ng, nx, ny, nh, nt});
+            ndata[nk]  = {nx, ny, nh, nphase, nt};
+            open.push({ng + hval(nx, ny), ng, nx, ny, nh, nphase, nt});
         }
     }
 
@@ -291,9 +409,45 @@ struct Conflict {
     int x1, y1, x2, y2; // edge (a1 direction)
 };
 
+struct ConflictSummary {
+    int vertex = 0;
+    int edge   = 0;
+
+    int total() const { return vertex + edge; }
+};
+
 static Step path_at(const Path& p, int t) {
     if (p.empty()) return {t, -1, -1, 0};
     return (t < (int)p.size()) ? p[t] : p.back();
+}
+
+static ConflictSummary summarize_conflicts(const std::vector<Path>& paths) {
+    ConflictSummary summary;
+    int n = (int)paths.size();
+    int T = 0;
+    for (auto& p : paths) T = std::max(T, (int)p.size());
+    T = std::min(T + 1, MAX_TIMESTEP);
+
+    for (int t = 0; t < T; ++t) {
+        for (int i = 0; i < n; ++i) {
+            Step si = path_at(paths[i], t);
+            for (int j = i + 1; j < n; ++j) {
+                Step sj = path_at(paths[j], t);
+                if (si.x == sj.x && si.y == sj.y) {
+                    ++summary.vertex;
+                }
+                if (t + 1 < T) {
+                    Step si2 = path_at(paths[i], t + 1);
+                    Step sj2 = path_at(paths[j], t + 1);
+                    if (si.x == sj2.x && si.y == sj2.y &&
+                        sj.x == si2.x && sj.y == si2.y) {
+                        ++summary.edge;
+                    }
+                }
+            }
+        }
+    }
+    return summary;
 }
 
 // Returns the first conflict found, or empty vector if none.
@@ -330,18 +484,84 @@ struct CTNode {
     int                 cost;
 };
 
+struct PlannerStats {
+    std::string algorithm;
+    std::string status = "unknown";
+    int nodes_expanded = 0;
+    int low_level_searches = 0;
+    int root_vertex_conflicts = 0;
+    int root_edge_conflicts = 0;
+    int planned_agents = 0;
+    int skipped_agents = 0;
+    int passes = 0;
+    int pass1_stuck = 0;
+    bool node_limit_hit = false;
+    double runtime_sec = 0.0;
+    int makespan = 0;
+    int sum_of_costs = 0;
+};
+
 static int sum_cost(const std::vector<Path>& paths) {
     int c = 0;
     for (auto& p : paths) c += (int)p.size();
     return c;
 }
 
+static int count_planned_agents(const std::vector<Path>& paths) {
+    int n = 0;
+    for (auto& p : paths) if (!p.empty()) ++n;
+    return n;
+}
+
+static int compute_makespan(const std::vector<Path>& paths) {
+    int max_t = 0;
+    for (auto& p : paths) if (!p.empty()) max_t = std::max(max_t, p.back().t);
+    return max_t;
+}
+
+static double elapsed_seconds(const std::chrono::steady_clock::time_point& t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static void finalize_stats(PlannerStats& stats, const std::vector<Path>& paths) {
+    stats.planned_agents = count_planned_agents(paths);
+    stats.skipped_agents = (int)paths.size() - stats.planned_agents;
+    stats.sum_of_costs   = sum_cost(paths);
+    stats.makespan       = compute_makespan(paths);
+}
+
+static void print_stats(const PlannerStats& stats) {
+    auto old_flags = std::cout.flags();
+    auto old_prec  = std::cout.precision();
+    std::cout << std::fixed << std::setprecision(6);
+    std::cout << "STAT"
+              << " algorithm=" << stats.algorithm
+              << " status=" << stats.status
+              << " runtime_sec=" << stats.runtime_sec
+              << " planned_agents=" << stats.planned_agents
+              << " skipped_agents=" << stats.skipped_agents
+              << " makespan=" << stats.makespan
+              << " sum_of_costs=" << stats.sum_of_costs
+              << " low_level_searches=" << stats.low_level_searches
+              << " passes=" << stats.passes
+              << " pass1_stuck=" << stats.pass1_stuck
+              << " nodes_expanded=" << stats.nodes_expanded
+              << " root_vertex_conflicts=" << stats.root_vertex_conflicts
+              << " root_edge_conflicts=" << stats.root_edge_conflicts
+              << " root_conflicts=" << (stats.root_vertex_conflicts + stats.root_edge_conflicts)
+              << " node_limit_hit=" << (stats.node_limit_hit ? 1 : 0)
+              << "\n";
+    std::cout.flags(old_flags);
+    std::cout.precision(old_prec);
+}
+
 struct CTCmp {
     bool operator()(const CTNode* a, const CTNode* b) { return a->cost > b->cost; }
 };
 
-static std::vector<Path> cbs(const Map& map) {
+static std::vector<Path> cbs(const Map& map, PlannerStats& stats) {
     int n = (int)map.agents.size();
+    stats.algorithm = "CBS";
     std::cout << "CBS: planning for " << n << " agents\n";
 
     // Precompute BFS heuristics for each agent
@@ -352,6 +572,7 @@ static std::vector<Path> cbs(const Map& map) {
     // Root node
     auto* root = new CTNode();
     for (int i = 0; i < n; ++i) {
+        ++stats.low_level_searches;
         Path p = low_level_astar(map, map.agents[i], root->cons, i, h_tables[i]);
         if (p.empty()) {
             std::cerr << "  Agent " << i << " has no individual path — skipping.\n";
@@ -360,6 +581,11 @@ static std::vector<Path> cbs(const Map& map) {
         root->paths.push_back(p);
     }
     root->cost = sum_cost(root->paths);
+    {
+        ConflictSummary root_summary = summarize_conflicts(root->paths);
+        stats.root_vertex_conflicts = root_summary.vertex;
+        stats.root_edge_conflicts   = root_summary.edge;
+    }
 
     std::priority_queue<CTNode*, std::vector<CTNode*>, CTCmp> open;
     open.push(root);
@@ -370,16 +596,20 @@ static std::vector<Path> cbs(const Map& map) {
     while (!open.empty()) {
         CTNode* cur = open.top(); open.pop();
         ++nodes_expanded;
+        stats.nodes_expanded = nodes_expanded;
 
         if (nodes_expanded % 200 == 0) {
-            double sec = std::chrono::duration<double>(
-                             std::chrono::steady_clock::now() - t0).count();
+            double sec = elapsed_seconds(t0);
             std::cout << "  CBS nodes=" << nodes_expanded
                       << "  cost=" << cur->cost << "  t=" << sec << "s\n";
         }
         if (nodes_expanded > MAX_CBS_NODES) {
             std::cout << "CBS: node limit reached — returning best-effort solution\n";
             auto result = cur->paths;
+            stats.status = "best_effort";
+            stats.node_limit_hit = true;
+            stats.runtime_sec = elapsed_seconds(t0);
+            finalize_stats(stats, result);
             delete cur;
             while (!open.empty()) { delete open.top(); open.pop(); }
             return result;
@@ -389,6 +619,9 @@ static std::vector<Path> cbs(const Map& map) {
         if (conflicts.empty()) {
             std::cout << "CBS: optimal solution found after " << nodes_expanded << " nodes\n";
             auto result = cur->paths;
+            stats.status = "optimal";
+            stats.runtime_sec = elapsed_seconds(t0);
+            finalize_stats(stats, result);
             delete cur;
             while (!open.empty()) { delete open.top(); open.pop(); }
             return result;
@@ -410,6 +643,7 @@ static std::vector<Path> cbs(const Map& map) {
                     child->cons.edge.push_back({ag, c.x2,c.y2,c.x1,c.y1, c.t});
             }
 
+            ++stats.low_level_searches;
             Path p = low_level_astar(map, map.agents[ag], child->cons, ag, h_tables[ag]);
             if (p.empty()) { delete child; continue; }
             child->paths[ag] = p;
@@ -420,6 +654,8 @@ static std::vector<Path> cbs(const Map& map) {
     }
 
     std::cerr << "CBS: no solution found.\n";
+    stats.status = "failed";
+    stats.runtime_sec = elapsed_seconds(t0);
     return {};
 }
 
@@ -432,29 +668,30 @@ using ReservedSet = std::set<std::tuple<int,int,int>>;   // (x, y, t)
 static Path pp_astar(const Map& map, const AgentDef& agent,
                      const ReservedSet& reserved,
                      const std::vector<std::vector<int>>& hdist) {
-    int gx = agent.gx, gy = agent.gy;
+    int gx = agent.gx, gy = agent.gy, gh = agent.gh;
     auto hval = [&](int x, int y) -> int {
         return (hdist[x][y] == INT_MAX) ? 0 : hdist[x][y];
     };
 
     std::unordered_map<long long, int>       gcost;
     std::unordered_map<long long, long long>  parent;
-    struct NI { int x, y, h, t; };
+    struct NI { int x, y, h, phase, t; };
     std::unordered_map<long long, NI>         ndata;
 
     std::priority_queue<AStarNode, std::vector<AStarNode>, std::greater<AStarNode>> open;
     int sx=agent.sx, sy=agent.sy, sh=agent.sh;
-    long long sk = encode(sx,sy,sh,0);
-    open.push({hval(sx,sy), 0, sx, sy, sh, 0});
-    gcost[sk]=0; parent[sk]=-1; ndata[sk]={sx,sy,sh,0};
+    long long sk = encode(sx,sy,sh,TURN_NONE,0);
+    open.push({hval(sx,sy), 0, sx, sy, sh, TURN_NONE, 0});
+    gcost[sk]=0; parent[sk]=-1; ndata[sk]={sx,sy,sh,TURN_NONE,0};
 
     long long goal_key = -1;
     while (!open.empty()) {
         AStarNode cur = open.top(); open.pop();
-        long long ck = encode(cur.x,cur.y,cur.h,cur.t);
+        long long ck = encode(cur.x,cur.y,cur.h,cur.phase,cur.t);
         if (gcost.count(ck) && gcost[ck] < cur.g) continue;
 
-        if (cur.x==gx && cur.y==gy) {
+        if (cur.phase == TURN_NONE &&
+            cur.x==gx && cur.y==gy && (gh < 0 || cur.h == gh)) {
             // Only park here if no previously-planned agent will visit this cell
             // at any future timestep (parking is permanent — an agent stays here
             // forever, so a future transit by another agent would be a conflict).
@@ -468,24 +705,54 @@ static Path pp_astar(const Map& map, const AgentDef& agent,
         if (cur.t >= MAX_TIMESTEP) continue;
 
         int nt = cur.t+1;
-        for (int act = 0; act < 5; ++act) {
-            int nx=cur.x, ny=cur.y, nh=cur.h;
-            bool moves=false;
-            if      (act==0){nx+=DX[cur.h];ny+=DY[cur.h];moves=true;}
-            else if (act==1){nx-=DX[cur.h];ny-=DY[cur.h];moves=true;}
-            else if (act==2){nh=(cur.h+1)%4;}
-            else if (act==3){nh=(cur.h+3)%4;}
+        if (is_pending_turn(cur.phase)) {
+            int nx=cur.x, ny=cur.y, nh=cur.h, nphase=cur.phase;
+            apply_completion(cur.x, cur.y, cur.h, cur.phase, nx, ny, nh, nphase);
 
             if (!map.passable(nx,ny)) continue;
             if (reserved.count({nx,ny,nt})) continue;
-            // Swap conflict: if agent moves (x,y)->(nx,ny) and reserved cell has (nx,ny,t) AND (x,y,nt)
+            if (reserved.count({cur.x,cur.y,nt}) && reserved.count({nx,ny,cur.t})) continue;
+
+            int ng = cur.g+1;
+            long long nk = encode(nx,ny,nh,nphase,nt);
+            if (gcost.count(nk) && gcost[nk]<=ng) continue;
+            gcost[nk]=ng; parent[nk]=ck; ndata[nk]={nx,ny,nh,nphase,nt};
+            open.push({ng+hval(nx,ny), ng, nx, ny, nh, nphase, nt});
+            continue;
+        }
+
+        for (int act = 0; act < 5; ++act) {
+            int nx=cur.x, ny=cur.y, nh=cur.h, nphase=TURN_NONE;
+            bool moves=false;
+
+            if (act == 0) {
+                nx += DX[cur.h];
+                ny += DY[cur.h];
+                moves = true;
+            } else if (act == 1) {
+                nx -= DX[cur.h];
+                ny -= DY[cur.h];
+                moves = true;
+            } else if (act == 2 || act == 3) {
+                int ix = cur.x, iy = cur.y;
+                nphase = (act == 2) ? TURN_LEFT_PENDING : TURN_RIGHT_PENDING;
+                if (!can_start_turn(map, cur.x, cur.y, cur.h, nphase, ix, iy)) continue;
+                nx = ix;
+                ny = iy;
+                moves = true;
+            }
+
+            if (!map.passable(nx,ny)) continue;
+            if (reserved.count({nx,ny,nt})) continue;
+            // Swap conflict: if agent moves (x,y)->(nx,ny) and reserved cell has
+            // (nx,ny,t) AND (x,y,nt)
             if (moves && reserved.count({cur.x,cur.y,nt}) && reserved.count({nx,ny,cur.t})) continue;
 
             int ng = cur.g+1;
-            long long nk = encode(nx,ny,nh,nt);
+            long long nk = encode(nx,ny,nh,nphase,nt);
             if (gcost.count(nk) && gcost[nk]<=ng) continue;
-            gcost[nk]=ng; parent[nk]=ck; ndata[nk]={nx,ny,nh,nt};
-            open.push({ng+hval(nx,ny), ng, nx, ny, nh, nt});
+            gcost[nk]=ng; parent[nk]=ck; ndata[nk]={nx,ny,nh,nphase,nt};
+            open.push({ng+hval(nx,ny), ng, nx, ny, nh, nphase, nt});
         }
     }
     if (goal_key==-1) return {};
@@ -504,9 +771,11 @@ static Path pp_astar(const Map& map, const AgentDef& agent,
 
 // ── Prioritized Planning ──────────────────────────────────────────────────────
 
-static std::vector<Path> prioritized_planning(const Map& map) {
+static std::vector<Path> prioritized_planning(const Map& map, PlannerStats& stats) {
     int n = (int)map.agents.size();
+    stats.algorithm = "PP";
     std::cout << "Prioritized Planning: " << n << " agents\n";
+    auto t0 = std::chrono::steady_clock::now();
 
     // Priority: plan agents front-of-queue first (lowest start y = closest to
     // the interior entry).  This lets the front of the perimeter queue clear
@@ -532,6 +801,7 @@ static std::vector<Path> prioritized_planning(const Map& map) {
             if (skip_agents.count(i)) continue;
 
             auto hdist = bfs_heuristic(map, map.agents[i].gx, map.agents[i].gy);
+            ++stats.low_level_searches;
             Path p = pp_astar(map, map.agents[i], reserved, hdist);
 
             if (p.empty()) {
@@ -555,15 +825,20 @@ static std::vector<Path> prioritized_planning(const Map& map) {
     };
 
     // ── Pass 1: unconstrained ─────────────────────────────────────────────────
+    stats.passes = 1;
     std::vector<Path> paths = run_pass({}, {});
 
     // Identify stuck agents (empty path = could not be planned)
     std::set<int> stuck;
     for (int i = 0; i < n; ++i)
         if (paths[i].empty()) stuck.insert(i);
+    stats.pass1_stuck = (int)stuck.size();
 
     if (stuck.empty()) {
         std::cout << "Prioritized Planning: done.\n";
+        stats.status = "complete";
+        stats.runtime_sec = elapsed_seconds(t0);
+        finalize_stats(stats, paths);
         return paths;
     }
 
@@ -580,6 +855,7 @@ static std::vector<Path> prioritized_planning(const Map& map) {
             stuck_blocks.insert({sx, sy, t});
     }
 
+    stats.passes = 2;
     paths = run_pass(stuck_blocks, stuck);
 
     // Count remaining stuck agents
@@ -590,6 +866,9 @@ static std::vector<Path> prioritized_planning(const Map& map) {
         std::cerr << "  " << still_stuck << " additional agent(s) stuck after pass 2.\n";
 
     std::cout << "Prioritized Planning: done.\n";
+    stats.status = still_stuck ? "partial" : "complete";
+    stats.runtime_sec = elapsed_seconds(t0);
+    finalize_stats(stats, paths);
     return paths;
 }
 
@@ -640,17 +919,17 @@ int main(int argc, char* argv[]) {
     if (map.agents.empty()) { std::cerr << "No agents.\n"; return 1; }
 
     std::vector<Path> paths;
+    PlannerStats stats;
     if (use_pp)
-        paths = prioritized_planning(map);
+        paths = prioritized_planning(map, stats);
     else
-        paths = cbs(map);
+        paths = cbs(map, stats);
 
     if (paths.empty()) { std::cerr << "No solution.\n"; return 1; }
 
     write_trajectories(paths, out_path);
+    print_stats(stats);
 
-    int max_t = 0;
-    for (auto& p : paths) if (!p.empty()) max_t = std::max(max_t, p.back().t);
-    std::cout << "Makespan: " << max_t << "  agents: " << paths.size() << "\n";
+    std::cout << "Makespan: " << stats.makespan << "  agents: " << paths.size() << "\n";
     return 0;
 }

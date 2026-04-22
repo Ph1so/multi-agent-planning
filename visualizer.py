@@ -44,6 +44,7 @@ produced by any planner.
 import argparse
 import os
 import sys
+import math
 import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
@@ -77,6 +78,7 @@ def _agent_color(i: int, total: int):
 HEADING_DXY = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
 # heading → rotation of '^' marker in degrees  ('^' points North by default)
 HEADING_ROT  = {0: -90, 1: 0, 2: 90, 3: 180}
+HEADING_ANGLE = {0: 0.0, 1: 90.0, 2: 180.0, 3: 270.0}
 HEADING_NAMES = {0: 'E', 1: 'N', 2: 'W', 3: 'S'}
 
 
@@ -272,6 +274,18 @@ def _make_legend(map_data: dict, with_agents: bool = True) -> list:
     return elems
 
 
+def _animated_agent_style(num_agents: int) -> dict[str, float]:
+    """Return car-body radius and heading-stick geometry in map-cell units."""
+    radius = 0.34 if num_agents <= 20 else 0.24
+    return {
+        'radius': radius,
+        'heading_back': radius * 0.7,
+        'heading_front': radius * 1.35,
+        'edge_lw': 1.0 if num_agents <= 20 else 0.8,
+        'heading_lw': 2.0 if num_agents <= 20 else 1.6,
+    }
+
+
 # ── Static view ────────────────────────────────────────────────────────────
 
 def static_view(map_data: dict, show_agents: bool = True,
@@ -293,23 +307,119 @@ def static_view(map_data: dict, show_agents: bool = True,
 
 # ── Animation ──────────────────────────────────────────────────────────────
 
+def _interp_heading(h0: int | None, h1: int | None, a: float) -> float | None:
+    """Interpolate heading across one action using the shortest signed turn."""
+    if h0 is None and h1 is None:
+        return None
+    if h0 is None:
+        return HEADING_ANGLE[h1]
+    if h1 is None:
+        return HEADING_ANGLE[h0]
+
+    delta = (h1 - h0) % 4
+    angle0 = HEADING_ANGLE[h0]
+    if delta == 0:
+        return angle0
+    if delta == 1:
+        return angle0 + 90.0 * a
+    if delta == 3:
+        return angle0 - 90.0 * a
+    return angle0 + 180.0 * a
+
+
+def _smoothstep(a: float) -> float:
+    a = max(0.0, min(1.0, a))
+    return a * a * (3.0 - 2.0 * a)
+
+
+def _turn_completion_kind(a: np.ndarray, b: np.ndarray) -> str | None:
+    """Return 'left'/'right' if a->b is a turn-completion step, else None."""
+    h0 = int(round(a[3])) if len(a) > 3 and a[3] >= 0 else None
+    h1 = int(round(b[3])) if len(b) > 3 and b[3] >= 0 else None
+    if h0 is None or h1 is None:
+        return None
+
+    dx = b[1] - a[1]
+    dy = b[2] - a[2]
+    if (h1 - h0) % 4 == 1 and (dx, dy) == HEADING_DXY[(h0 + 1) % 4]:
+        return 'left'
+    if (h1 - h0) % 4 == 3 and (dx, dy) == HEADING_DXY[(h0 + 3) % 4]:
+        return 'right'
+    return None
+
+
+def _turn_macro_start(traj: np.ndarray, idx: int) -> bool:
+    """Return True if traj[idx:idx+3] encodes the 2-step turn maneuver."""
+    if idx < 0 or idx + 2 >= len(traj):
+        return False
+
+    a, b, c = traj[idx], traj[idx + 1], traj[idx + 2]
+    if abs((b[0] - a[0]) - 1.0) > 1e-9 or abs((c[0] - b[0]) - 1.0) > 1e-9:
+        return False
+
+    h = int(round(a[3])) if len(a) > 3 and a[3] >= 0 else None
+    hb = int(round(b[3])) if len(b) > 3 and b[3] >= 0 else None
+    if h is None or hb != h:
+        return False
+
+    if (b[1] - a[1], b[2] - a[2]) != HEADING_DXY[h]:
+        return False
+
+    return _turn_completion_kind(b, c) is not None
+
+
+def _interp_turn_macro(traj: np.ndarray, start_idx: int, t: float):
+    """Interpolate a 2-step turn macro with eased motion and rotation."""
+    a = traj[start_idx]
+    b = traj[start_idx + 1]
+    c = traj[start_idx + 2]
+    t0 = a[0]
+    total = c[0] - t0
+    u = 0.0 if total <= 0 else (t - t0) / total
+    u = max(0.0, min(1.0, u))
+
+    if u <= 0.5:
+        local = _smoothstep(u * 2.0)
+        x = a[1] + local * (b[1] - a[1])
+        y = a[2] + local * (b[2] - a[2])
+    else:
+        local = _smoothstep((u - 0.5) * 2.0)
+        x = b[1] + local * (c[1] - b[1])
+        y = b[2] + local * (c[2] - b[2])
+
+    h0 = int(round(a[3])) if len(a) > 3 and a[3] >= 0 else None
+    h2 = int(round(c[3])) if len(c) > 3 and c[3] >= 0 else None
+    return x, y, _interp_heading(h0, h2, _smoothstep(u))
+
+
 def _interp(traj: np.ndarray, t: float):
-    """Return (x, y, heading_or_None) at time t via linear interpolation."""
+    """Return (x, y, heading_angle_deg_or_None) at time t via interpolation."""
     if len(traj) == 0:
         return None
     ts = traj[:, 0]
     if t <= ts[0]:
-        r = traj[0]
+        r0 = r1 = traj[0]
+        a = 0.0
     elif t >= ts[-1]:
-        r = traj[-1]
+        r0 = r1 = traj[-1]
+        a = 0.0
     else:
         idx = int(np.searchsorted(ts, t)) - 1
         t0, t1 = ts[idx], ts[idx + 1]
         a = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-        r = traj[idx] + a * (traj[idx + 1] - traj[idx])
-    x, y = r[1], r[2]
-    h = int(round(r[3])) if len(r) > 3 and r[3] >= 0 else None
-    return x, y, h
+        r0 = traj[idx]
+        r1 = traj[idx + 1]
+
+        if _turn_macro_start(traj, idx):
+            return _interp_turn_macro(traj, idx, t)
+        if _turn_macro_start(traj, idx - 1):
+            return _interp_turn_macro(traj, idx - 1, t)
+
+    x = r0[1] + a * (r1[1] - r0[1])
+    y = r0[2] + a * (r1[2] - r0[2])
+    h0 = int(round(r0[3])) if len(r0) > 3 and r0[3] >= 0 else None
+    h1 = int(round(r1[3])) if len(r1) > 3 and r1[3] >= 0 else None
+    return x, y, _interp_heading(h0, h1, a)
 
 
 def animate_view(map_data: dict, trajectories: list,
@@ -317,6 +427,8 @@ def animate_view(map_data: dict, trajectories: list,
     n = map_data['num_agents']
     non_empty = [t for t in trajectories if len(t) > 0]
     t_max = int(max(t[:, 0].max() for t in non_empty)) if non_empty else 0
+    substeps = 8
+    agent_style = _animated_agent_style(n)
 
     fig, ax = plt.subplots(figsize=(14, 11))
     _setup_axes(ax, map_data, 'Parking Lot — Multi-Agent Planning Animation')
@@ -324,16 +436,25 @@ def animate_view(map_data: dict, trajectories: list,
 
     # Per-agent artists:
     #   path_line  – trail of visited cells
-    #   car_dot    – circle body  (scatter, easy to update)
+    #   car_dot    – circle body
     #   dir_arrow  – line showing heading direction
     path_lines, car_dots, dir_arrows = [], [], []
-    dot_size  = 12 if n <= 20 else 6   # shrink dots for many agents
     for i in range(n):
         c = _agent_color(i, n)
         line, = ax.plot([], [], '-', color=c, alpha=0.35, lw=1.5, zorder=4)
-        dot,  = ax.plot([], [], 'o', color=c, markersize=dot_size,
-                        markeredgecolor='white', markeredgewidth=1.0, zorder=8)
-        arr,  = ax.plot([], [], '-', color='white', lw=2.0, zorder=9)
+        dot = mpatches.Circle(
+            (0.0, 0.0),
+            radius=agent_style['radius'],
+            facecolor=c,
+            edgecolor='white',
+            linewidth=agent_style['edge_lw'],
+            zorder=8,
+            visible=False,
+        )
+        ax.add_patch(dot)
+        arr, = ax.plot([], [], '-', color='white',
+                       lw=agent_style['heading_lw'],
+                       solid_capstyle='round', zorder=9)
         path_lines.append(line)
         car_dots.append(dot)
         dir_arrows.append(arr)
@@ -347,7 +468,7 @@ def animate_view(map_data: dict, trajectories: list,
               fontsize=8, framealpha=0.9)
 
     def update(frame):
-        time_text.set_text(f't = {frame}')
+        time_text.set_text(f't = {frame:.2f}')
         artists = [time_text]
         for i, (traj, pline, dot, arr) in enumerate(
                 zip(trajectories, path_lines, car_dots, dir_arrows)):
@@ -355,30 +476,46 @@ def animate_view(map_data: dict, trajectories: list,
                 continue
             past = traj[traj[:, 0] <= frame]
             if len(past):
-                pline.set_data(past[:, 1], past[:, 2])
+                line_x = list(past[:, 1])
+                line_y = list(past[:, 2])
+                result = _interp(traj, frame)
+                if result:
+                    line_x.append(result[0])
+                    line_y.append(result[1])
+                pline.set_data(line_x, line_y)
             result = _interp(traj, frame)
             if result:
-                x, y, h = result
-                dot.set_data([x], [y])
-                if h is not None:
-                    dx, dy = HEADING_DXY[h]
+                x, y, angle = result
+                dot.center = (x, y)
+                dot.set_visible(True)
+                if angle is not None:
+                    ang = math.radians(angle)
+                    dx, dy = math.cos(ang), math.sin(ang)
                     # Draw a short line from center in the heading direction
-                    arr.set_data([x - dx * 0.3, x + dx * 0.55],
-                                 [y - dy * 0.3, y + dy * 0.55])
+                    arr.set_data(
+                        [x - dx * agent_style['heading_back'],
+                         x + dx * agent_style['heading_front']],
+                        [y - dy * agent_style['heading_back'],
+                         y + dy * agent_style['heading_front']],
+                    )
                 else:
                     arr.set_data([], [])
+            else:
+                dot.set_visible(False)
+                arr.set_data([], [])
             artists += [pline, dot, arr]
         return artists
 
     ani = animation.FuncAnimation(
-        fig, update, frames=range(t_max + 1),
-        interval=int(1000 / fps), blit=True,
+        fig, update,
+        frames=np.arange(0.0, t_max + 1e-9, 1.0 / substeps),
+        interval=int(1000 / (fps * substeps)), blit=True,
     )
 
     os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
     ext = save_path.rsplit('.', 1)[-1].lower()
     writer = 'pillow' if ext == 'gif' else 'ffmpeg'
-    ani.save(save_path, writer=writer, fps=fps)
+    ani.save(save_path, writer=writer, fps=fps * substeps)
     print(f'Saved animation: {save_path}')
     plt.close()
 

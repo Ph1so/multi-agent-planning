@@ -22,7 +22,7 @@ CBS is a two-level algorithm that finds provably optimal, collision-free paths.
 **Low-level (Space-Time A\*):**
 - Plans a single agent through 4D state space: `(x, y, heading, t)`
 - Respects vertex constraints `(agent, x, y, t)` and edge constraints `(agent, x1, y1, x2, y2, t)`
-- Heuristic: precomputed BFS distance from goal, ignoring heading and time — admissible because heading changes cost ≤ 1 extra step per move
+- Heuristic: precomputed BFS distance from goal, ignoring heading and time — admissible because each action changes position by at most one grid cell
 - 64-bit state encoding for O(1) closed-set lookup: `(t << 20) | (x << 10) | (y << 4) | heading`
 
 **Practical limits:** CBS is exponential in the number of conflicts. A hard cap of `MAX_CBS_NODES = 10,000` prevents runaway search; the best solution found so far is returned if exceeded. Reliable up to ~4–6 agents on the main lot.
@@ -97,19 +97,27 @@ Stored in a `std::priority_queue` (min-heap by f-value).
 
 ## Motion Model
 
-Each agent has **5 actions**, all with uniform cost 1:
+Each agent has **5 control actions**. `FORWARD`, `BACKWARD`, and `WAIT` each
+consume one timestep. `TURN_LEFT` and `TURN_RIGHT` execute as 2-timestep
+maneuvers with an intermediate forward state:
 
 | Action | Effect |
 |--------|--------|
 | FORWARD | `(x,y) → (x + DX[h], y + DY[h])` |
 | BACKWARD | `(x,y) → (x − DX[h], y − DY[h])` |
-| TURN_LEFT | `heading = (h + 1) % 4` |
-| TURN_RIGHT | `heading = (h + 3) % 4` |
+| TURN_LEFT | `(x,y,h) → (x + DX[h], y + DY[h], h)` then `(x + DX[h] + DX[h_l], y + DY[h] + DY[h_l], h_l)` |
+| TURN_RIGHT | `(x,y,h) → (x + DX[h], y + DY[h], h)` then `(x + DX[h] + DX[h_r], y + DY[h] + DY[h_r], h_r)` |
 | WAIT | no change |
 
 Heading deltas: `DX = {1, 0, -1, 0}`, `DY = {0, 1, 0, -1}` for East/North/West/South.
 
-An agent **cannot move and turn in the same timestep** — motion and rotation are independent actions.
+Turns are **not in place** and no longer complete in one step: the planner
+models a car-like cornering motion that first advances into the forward cell,
+then finishes in the forward-left or forward-right cell on the following
+timestep.
+
+Goal completion is pose-based: a parking goal is only satisfied once the agent
+reaches the target cell while facing the separator wall.
 
 ---
 
@@ -123,7 +131,7 @@ std::vector<std::vector<int>> bfs_heuristic(const Map& map, int gx, int gy);
 
 - BFS runs on the 2D grid ignoring heading and time constraints
 - Returns `dist[x][y]` = minimum number of moves from `(x,y)` to `(gx, gy)`
-- **Admissible:** the BFS distance lower-bounds true cost since heading changes cost at most 1 turn per cell traversed
+- **Admissible:** the BFS distance lower-bounds true cost because no action can reduce the remaining grid distance by more than 1
 - **Efficient:** precomputed once per agent per CT node (low-level replanning still uses the same BFS map)
 
 ---
@@ -159,7 +167,7 @@ C
 A
 <num_agents>
 <sx>,<sy>,<heading>          # start for agent i (heading: N/S/E/W or 0–3)
-<gx>,<gy>                    # goal for agent i
+<gx>,<gy>[,<heading>]        # goal for agent i (heading optional)
 ...
 M
 <row of comma-separated cell values for y=0>
@@ -169,13 +177,16 @@ M
 
 **Cell values:** `0` = road, `1` = parking spot, `≥100` = wall/obstacle.
 
+If a goal heading is omitted and the goal cell is a parking spot, the planner
+infers the required parked heading from the unique adjacent separator wall.
+
 ### Map Scenarios
 
 | Map | Dimensions | Max Agents | Challenge |
 |-----|-----------|------------|-----------|
 | Main parking lot | 28×64 | 144 | Dense interior navigation |
 | Gauntlet | 16×24 | 24 | Bidirectional 2-cell bottleneck |
-| Two Lots | 48×38 | 16 | Cross-lot travel via 3 roads |
+| Two Lots | 48×52 | 16 | Cross-lot travel via 3 roads |
 | Two Lots Gauntlet | 30×26 | — | Compact bottleneck variant |
 
 ---
@@ -240,7 +251,8 @@ Produces a GIF (or MP4) animating agent trajectories:
 - **Vertex conflicts:** two agents at same `(x, y, t)`
 - **Edge conflicts:** two agents swapping cells between timesteps
 - **Wall collisions:** agent moves into a cell with value ≥ `collision_thresh`
-- **Illegal moves:** any step that doesn't match one of the 5 valid actions (forward, backward, turn-left, turn-right, wait)
+- **Illegal moves:** any step that doesn't match the 1-step controls or the
+  required 2-step turn completion pattern
 
 The checker is independent of the planner and can validate trajectories from any source.
 

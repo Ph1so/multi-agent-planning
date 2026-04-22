@@ -137,11 +137,36 @@ def generate() -> np.ndarray:
     return g
 
 
+def infer_goal_heading(grid: np.ndarray, gx: int, gy: int):
+    """Return wall-facing parking heading, or None if not uniquely determined."""
+    if grid[gx, gy] != SPOT:
+        return None
+
+    def is_wall(x, y):
+        if x < 0 or x >= W or y < 0 or y >= H:
+            return True
+        return grid[x, y] >= COLLISION_THRESH
+
+    north_wall = is_wall(gx, gy + 1)
+    south_wall = is_wall(gx, gy - 1)
+    if north_wall != south_wall:
+        return 1 if north_wall else 3
+
+    found = None
+    for h, (dx, dy) in enumerate([(1, 0), (0, 1), (-1, 0), (0, -1)]):
+        if not is_wall(gx + dx, gy + dy):
+            continue
+        if found is not None:
+            return None
+        found = h
+    return found
+
+
 def write_map(grid: np.ndarray, path: str, agents=()) -> None:
     """
     Write map file.
 
-    Agent tuple format:  ((sx, sy, heading), (gx, gy))
+    Agent tuple format:  ((sx, sy, heading), (gx, gy)) or ((sx, sy, heading), (gx, gy, goal_heading))
       heading: 'N', 'S', 'E', 'W'  or  0/1/2/3
 
     File format:
@@ -149,7 +174,7 @@ def write_map(grid: np.ndarray, path: str, agents=()) -> None:
       C\\n<collision_threshold>
       A\\n<num_agents>
       <start_x>,<start_y>,<heading>   ← one line per agent start
-      <goal_x>,<goal_y>               ← one line per agent goal
+      <goal_x>,<goal_y>[,<heading>]   ← one line per agent goal
       M\\n
       <row y=0 : x_0,x_1,…,x_{W-1}>
       …
@@ -160,9 +185,14 @@ def write_map(grid: np.ndarray, path: str, agents=()) -> None:
         f.write(f'N\n{W},{H}\n')
         f.write(f'C\n{COLLISION_THRESH}\n')
         f.write(f'A\n{len(agents)}\n')
-        for (sx, sy, sh), (gx, gy) in agents:
+        for (sx, sy, sh), goal in agents:
+            gx, gy = goal[:2]
+            gh = goal[2] if len(goal) > 2 else infer_goal_heading(grid, gx, gy)
             f.write(f'{sx},{sy},{sh}\n')
-            f.write(f'{gx},{gy}\n')
+            if gh is None:
+                f.write(f'{gx},{gy}\n')
+            else:
+                f.write(f'{gx},{gy},{gh}\n')
         f.write('M\n')
         for y in range(H):
             f.write(','.join(str(grid[x, y]) for x in range(W)) + '\n')
