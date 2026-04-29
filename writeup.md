@@ -6,19 +6,17 @@
 
 ## Abstract
 
-We present a multi-agent path finding (MAPF) system for autonomous vehicles navigating shared parking lots from perimeter entry points to assigned parking spots without collision. The system implements two complementary algorithms: Conflict-Based Search (CBS), which finds provably optimal solutions, and Prioritized Planning (PP), which trades optimality for scalability. Both algorithms operate in a 4D state space $(x, y, \text{heading}, t)$ and model a kinematically realistic motion primitive set including 2-timestep turn maneuvers. We evaluate the system across four map scenarios of increasing difficulty with up to 24 agents. CBS is optimal for up to 8 agents (sub-10 ms) but becomes intractable beyond 12, while PP maintains millisecond-scale planning through all tested counts at a makespan cost of 4–46% above optimal.
+We built a multi-agent path finding (MAPF) system for autonomous vehicles navigating shared parking lots to assigned parking spots without collision. The system implements two algorithms learned in class: Conflict-Based Search (CBS), which finds provably optimal solutions, and Prioritized Planning (PP), which trades optimality for scalability. Both algorithms operate in a 4D state space $(x, y, \text{heading}, t)$ with a motion primitive set including 2-timestep turn maneuvers. The tradeoffs between the two algorithms were evident in our data collection. We evaluate the system across four map scenarios of increasing difficulty with up to 24 agents. CBS is optimal for up to 8 agents (sub-10 ms) but becomes intractable beyond 12, while PP maintains millisecond-scale planning through all tested counts at a makespan cost of 4–46% above optimal.
 
 ---
 
 ## 1. Introduction
 
-Autonomous vehicle (AV) parking is a coordination problem that grows rapidly in complexity with the number of vehicles. Vehicles must enter from limited access points, navigate shared lanes, avoid head-on conflicts at bottlenecks, and reach goal spots with a specific parking orientation — all without centralized real-time control.
+Autonomous vehicle (AV) parking is a coordination problem that grows quickly in complexity with the number of vehicles. Vehicles must enter from limited access points, navigate shared lanes, avoid head-on conflicts at bottlenecks, and reach goal spots with a specific parking orientation.
 
-We frame AV parking as a MAPF problem on a discrete grid where each agent occupies a single cell per timestep, carries an explicit heading, and must reach a designated goal cell facing the correct direction. We target two desirable properties that are often in tension: **solution optimality** (minimize total travel time) and **computational scalability** (plan for many vehicles in bounded time).
+We frame AV parking as a MAPF problem on a discrete grid where each agent occupies a single cell per timestep, with an explicit heading, and must reach a designated goal cell facing the correct direction. We targetted two goals: **solution optimality** (minimize total travel time) and **computational scalability** (plan for many vehicles in bounded time).
 
-A key feature of our motion model is that turns are **not in-place**: a turn maneuver advances the vehicle into an adjacent cell before completing the heading change, consuming two timesteps and two grid cells. This better models the kinematic constraints of real cars compared to agents that can rotate freely on the spot.
-
-Our contributions are: (1) a MAPF formulation with a car-like 2-timestep turn model and pose-based goal satisfaction; (2) implementations of CBS and PP in C++ with a BFS heuristic and 64-bit state encoding; (3) a suite of four map scenarios stress-testing coordination under progressively tighter bottlenecks; and (4) empirical evaluation revealing a sharp CBS tractability phase transition and PP's scalability advantage.
+Our project includes: (1) a MAPF formulation with a car-like 2-timestep turn model and pose-based goal completion; (2) implementations of CBS and PP in C++ with a BFS heuristic; (3) four map scenarios stress-testing coordination under progressively tighter bottlenecks; and (4) evaluations showing CBS vs PP and their tradeoffs.
 
 ---
 
@@ -38,7 +36,7 @@ Each agent has five control actions. Let $(\Delta x, \Delta y)$ be the unit disp
 | TURN\_LEFT | 2 | $(x,y,h) \to (x+\Delta x^h, y+\Delta y^h, h) \to (x+\Delta x^h+\Delta x^{h_L}, y+\Delta y^h+\Delta y^{h_L}, h_L)$ |
 | TURN\_RIGHT | 2 | $(x,y,h) \to (x+\Delta x^h, y+\Delta y^h, h) \to (x+\Delta x^h+\Delta x^{h_R}, y+\Delta y^h+\Delta y^{h_R}, h_R)$ |
 
-All actions have uniform cost 1 per timestep consumed, so a turn costs 2. Turns are not in-place: the vehicle advances into the forward cell before the heading changes.
+All actions have uniform cost 1 per timestep consumed, so a turn costs 2. Again, turns are not in-place so the vehicle moves into the forward cell before the heading changes.
 
 ### 2.2 Goals, Conflicts, and Objectives
 
